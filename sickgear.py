@@ -1,832 +1,648 @@
-#!/usr/bin/env python
-#
-# This file is part of SickGear.
-#
-# SickGear is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# SickGear is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with SickGear.  If not, see <http://www.gnu.org/licenses/>.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SickGear - FastAPI + SQLAlchemy Async (version optimisée)
+Améliorations appliquées:
+5. Compression des réponses optimisée
+6. Cache template plus intelligent
+7. Connection pooling pour HTTP client
+8. Async file operations
+12. Background tasks pour opérations lourdes
+13. Configuration dynamique
+"""
 
-# Check needed software dependencies to nudge users to fix their setup
-import codecs
-import datetime
-import errno
-import getopt
-import os
-import signal
-import sys
+# =========================
+# Imports
+# =========================
+import asyncio
+import hashlib
+import json
+import random
+import re
 import shutil
-import time
-import threading
-import warnings
+import subprocess
+import unicodedata
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+import aiofiles
+import aiofiles.os
+import httpx
+import uvicorn
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from jinja2 import BaseLoader, Environment, Template, select_autoescape
+from pydantic import BaseModel, validator
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    case,
+    distinct,
+    func,
+    select
+)
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+from functools import lru_cache
+import os
 
-warnings.filterwarnings('ignore', module=r'.*bs4_parser.*', message='.*No parser was explicitly specified.*')
-warnings.filterwarnings('ignore', module=r'.*Cheetah.*')
-warnings.filterwarnings('ignore', module=r'.*connectionpool.*', message='.*certificate verification.*')
-warnings.filterwarnings('ignore', module=r'.*fuzzywuzzy.*')
-warnings.filterwarnings('ignore', module=r'.*ssl_.*', message='.*SSLContext object.*')
-warnings.filterwarnings('ignore', module=r'.*zoneinfo.*', message='.*file or directory.*')
-warnings.filterwarnings('ignore', message='.*deprecated in cryptography.*')
-
-# noinspection DuplicatedCode
-versions = [((3, 10, 0), (3, 14, 0))]  # inclusive version ranges
-if not any(list(map(lambda v: v[0] <= sys.version_info[:3] <= v[1], versions))) and not int(os.environ.get('PYT', 0)):
-    major, minor, micro = sys.version_info[:3]
-    print(f'Python {major}.{minor}.{micro} detected.')
-    print('Sorry, SickGear requires a Python version %s' % ', '.join(map(
-        lambda r: '%s - %s' % tuple(map(lambda v: str(v).replace(', ', '.')[1:-1], r)), versions)))
-    sys.exit(1)
-
-sys.path.insert(1, os.path.abspath(os.path.join(os.path.dirname(__file__), 'lib')))
-is_win = 'win' == sys.platform[0:3]
-
+# Optimisation parsing : utiliser lxml si disponible
 try:
-    try:
-        py_cache_path = os.path.normpath(os.path.join(os.path.dirname(__file__), '__pycache__'))
-        for pf in ['_cleaner.pyc', '_cleaner.pyo']:
-            cleaner_file = os.path.normpath(os.path.join(os.path.normpath(os.path.dirname(__file__)), pf))
-            if os.path.isfile(cleaner_file):
-                os.remove(cleaner_file)
-        if os.path.isdir(py_cache_path):
-            shutil.rmtree(py_cache_path)
-    except (BaseException, Exception):
-        pass
-    import _cleaner
-    from sickgear import piper
-except (BaseException, Exception):
-    pass
+    from lxml import etree, html
+    LXML_AVAILABLE = True
+except ImportError:
+    LXML_AVAILABLE = False
 
+# Cache Redis optionnel
 try:
-    import Cheetah
-except (BaseException, Exception):
-    print('The Python module CT3 (Cheetah) is required')
-    if is_win:
-        print('(1) However, this first run may have just installed it, so try to simply rerun sickgear.py again')
-        print('(2) If this output is a rerun of (1) then open a command line prompt and manually install using...')
-    else:
-        print('Manually install using...')
-    print('cd <sickgear_installed_folder>')
-    print('python -m pip install --user -r requirements.txt')
-    print('python sickgear.py')
-    sys.exit(1)
+    import redis.asyncio as redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    redis = None
 
-# Compatibility fixes for Windows
-if is_win:
-    codecs.register(lambda name: codecs.lookup('utf-8') if name == 'cp65001' else None)
+# =========================
+# Config centralisée avec validation Pydantic
+# =========================
+class Settings(BaseModel):
+    base_url: str = "http://192.168.0.111:8081"
+    db_path: str = "/home/pomercier/Disque_dur/SickGear/sickbeard.db"
+    host: str = "0.0.0.0"
+    port: int = 5000
+    template_cache_exp_min: int = 60
+    template_cache_max_items: int = 200
+    bg_update_min: int = 30
+    httpx_timeout_s: float = 5.0
+    httpx_retries: int = 2
+    httpx_max_keepalive: int = 10
+    httpx_max_connections: int = 20
+    open_dolphin_allowed_base: str = "/home/pomercier/Disque_dur"
+    background_sample_limit: int = 200
+    enable_gzip: bool = True
+    gzip_min_size: int = 1000
+    gzip_compress_level: int = 6
+    redis_url: str = "redis://localhost:6379"
+    redis_cache_ttl_s: int = 300
+    redis_enabled: bool = True
+    config_file: str = "/tmp/sickgear_config.json"
 
-# We only need this for compiling an EXE
-from multiprocessing import freeze_support
+    @validator('db_path', 'open_dolphin_allowed_base')
+    def validate_paths(cls, v):
+        if not Path(v).exists():
+            raise ValueError(f"Path does not exist: {v}")
+        return v
 
-from configobj import ConfigObj
-# noinspection PyPep8Naming
-from encodingKludge import SYS_ENCODING
-from exceptions_helper import ex
-import sickgear
-from sickgear import db, logger, name_cache, network_timezones
-from sickgear.event_queue import Events
-from sickgear.tv import TVShow
-from sickgear.webserveInit import WebServer
+    class Config:
+        json_encoders = {
+            Path: lambda v: str(v)
+        }
 
-from six import integer_types, iteritems
-
-throwaway = datetime.datetime.strptime('20110101', '%Y%m%d')
-rollback_loaded = None
-
-for signal_type in [signal.SIGTERM, signal.SIGINT] + ([] if not is_win else [signal.SIGBREAK]):
-    signal.signal(signal_type, lambda signum, void: sickgear.sig_handler(signum=signum, _=void))
-
-
-class SickGear(object):
-    def __init__(self):
-        # system event callback for shutdown/restart
-        sickgear.events = Events(self.shutdown)
-
-        # daemon constants
-        self.run_as_daemon = False
-        self.create_pid = False
-        self.pid_file = ''
-
-        self.run_as_systemd = False
-        self.console_logging = False
-
-        # webserver constants
-        self.webserver = None
-        self.force_update = False
-        self.forced_port = None
-        self.no_launch = False
-
-        self.web_options = None
-        self.webhost = None
-        self.start_port = None
-        self.log_dir = None
-
-    @staticmethod
-    def help_message():
-        """
-        print help message for commandline options
-        """
-        global is_win
-        help_msg = ['']
-        help_msg += ['Usage: %s <option> <another option>\n' % sickgear.MY_FULLNAME]
-        help_msg += ['Options:\n']
-
-        help_tmpl = '    %-10s%-17s%s'
-        for ln in [
-            ('-h', '--help', 'Prints this message'),
-            ('-f', '--forceupdate', 'Force update all shows in the DB (from tvdb) on startup'),
-            ('-q', '--quiet', 'Disables logging to console'),
-            ('', '--nolaunch', 'Suppress launching web browser on startup')
-        ]:
-            help_msg += [help_tmpl % ln]
-
-        if is_win:
-            for ln in [
-                ('-d', '--daemon', 'Running as daemon is not supported on Windows'),
-                ('', '', 'On Windows, --daemon is substituted with: --quiet --nolaunch')
-            ]:
-                help_msg += [help_tmpl % ln]
-        else:
-            for ln in [
-                ('-d', '--daemon', 'Run as double forked daemon (includes options --quiet --nolaunch)'),
-                ('-s', '--systemd', 'Run as systemd service (includes options --quiet --nolaunch)'),
-                ('', '--pidfile=<path>', 'Combined with --daemon creates a pidfile (full path including filename)')
-            ]:
-                help_msg += [help_tmpl % ln]
-
-        for ln in [
-            ('-p <port>', '--port=<port>', 'Override default/configured port to listen on'),
-            ('', '--datadir=<path>', 'Override folder (full path) as location for'),
-            ('', '', 'storing database, configfile, cache, logfiles'),
-            ('', '', 'Default: %s' % sickgear.PROG_DIR),
-            ('', '--config=<path>', 'Override config filename (full path including filename)'),
-            ('', '', 'to load configuration from'),
-            ('', '', 'Default: config.ini in %s or --datadir location' % sickgear.PROG_DIR),
-            ('', '--noresize', 'Prevent resizing of the banner/posters even if PIL is installed')
-        ]:
-            help_msg += [help_tmpl % ln]
-
-        return '\n'.join(help_msg)
-
-    @staticmethod
-    def execute_rollback(mo, max_v, load_msg):
-        global rollback_loaded
+# Chargement initial de la configuration
+def load_config() -> Settings:
+    config_file = Path("/tmp/sickgear_config.json")
+    if config_file.exists():
         try:
-            if None is rollback_loaded:
-                rollback_loaded = db.get_rollback_module()
-            if None is not rollback_loaded:
-                rc = rollback_loaded.__dict__[mo]()
-                rc.load_msg = load_msg
-                rc.run(max_v)
-            else:
-                print('ERROR: Could not download Rollback Module.')
-        except (BaseException, Exception):
+            with open(config_file, 'r') as f:
+                config_data = json.load(f)
+                return Settings(**config_data)
+        except Exception:
+            return Settings()
+    return Settings()
+
+CONFIG = load_config()
+
+# =========================
+# Modèles Pydantic
+# =========================
+class Show(BaseModel):
+    Emission: Optional[str] = None
+    Saison: Optional[int] = None
+    Episode: Optional[int] = None
+    Nom_episode: Optional[str] = None
+    Reseau_de_streaming: Optional[str] = None
+    Location: Optional[str] = None
+    Showid: Optional[str] = None
+    show_id: Optional[int] = None
+    indexer_id: Optional[int] = None
+    thumbnail: Optional[str] = None
+
+class MissingEpisode(BaseModel):
+    manquant: Optional[str] = None
+    show_id: Optional[int] = None
+    indexer_id: Optional[int] = None
+    thumbnail: Optional[str] = None
+    airdate: Optional[int] = None
+
+class EndedShowData(BaseModel):
+    urls: List[str] = []
+    links: List[str] = []
+
+class UpcomingShow(BaseModel):
+    Emission: str
+    Date_diffusion: str
+    Image: str
+    indexer_id: Optional[str] = None
+    show_id: Optional[str] = None
+
+# =========================
+# SQLAlchemy ORM Models
+# =========================
+Base = declarative_base()
+
+class TVShow(Base):
+    __tablename__ = 'tv_shows'
+    indexer_id = Column(Integer, primary_key=True)
+    show_name = Column(String)
+    indexer = Column(Integer)
+    location = Column(String)
+    status = Column(String)
+
+class TVEpisode(Base):
+    __tablename__ = 'tv_episodes'
+    episode_id = Column(Integer, primary_key=True)
+    showid = Column(Integer)
+    season = Column(Integer)
+    episode = Column(Integer)
+    name = Column(String)
+    network = Column(String)
+    status = Column(Integer)
+    file_size = Column(Integer)
+    airdate = Column(Integer)
+
+# =========================
+# Engine & async session
+# =========================
+DATABASE_URL = f"sqlite+aiosqlite:///{CONFIG.db_path}"
+engine = create_async_engine(DATABASE_URL, future=True, connect_args={"check_same_thread": False})
+AsyncSessionFactory = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+# =========================
+# Cache Redis et décorateur
+# =========================
+redis_client = None
+if REDIS_AVAILABLE and CONFIG.redis_enabled:
+    try:
+        redis_client = redis.from_url(CONFIG.redis_url)
+    except Exception:
+        redis_client = None
+
+def cache_results(key_prefix: str, model: Optional[Any] = None):
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            if not redis_client:
+                return await func(*args, **kwargs)
+            arg_representation = str(args) + str(kwargs)
+            unique_suffix = hashlib.md5(arg_representation.encode()).hexdigest()
+            cache_key = f"{key_prefix}:{unique_suffix}"
+            try:
+                cached = await redis_client.get(cache_key)
+                if cached:
+                    data = json.loads(cached)
+                    if model and isinstance(data, list):
+                        return [model.model_validate(item) for item in data]
+                    elif model:
+                        return model.model_validate(data)
+                    return data
+            except Exception:
+                pass
+            result = await func(*args, **kwargs)
+            try:
+                if isinstance(result, list) and result and isinstance(result[0], BaseModel):
+                    json_to_cache = json.dumps([item.model_dump() for item in result])
+                elif isinstance(result, BaseModel):
+                    json_to_cache = result.model_dump_json()
+                else:
+                    json_to_cache = json.dumps(result)
+                await redis_client.setex(cache_key, CONFIG.redis_cache_ttl_s, json_to_cache)
+            except Exception:
+                pass
+            return result
+        return wrapper
+    return decorator
+
+# =========================
+# Helpers
+# =========================
+_INDEXER_SHOWID_RE = re.compile(r"(?:cache/images/shows/|shows/|tvid_prodid=)(\d+)[-:](\d+)")
+
+def extract_indexer_showid_from_url(url: str):
+    if not url: return None, None
+    match = _INDEXER_SHOWID_RE.search(url)
+    if match: return match.group(1), match.group(2)
+    parts = re.findall(r"(\d+)", url)
+    return (parts[-2], parts[-1]) if len(parts) >= 2 else (None, None)
+
+def format_image_url_from_raw(url: str) -> str:
+    if not url or url.startswith("http"): return url
+    if "cache/images/shows" in url: return f"{CONFIG.base_url}/{url.lstrip('/')}"
+    idx, sid = extract_indexer_showid_from_url(url)
+    if idx and sid: return f"{CONFIG.base_url}/cache/images/shows/{idx}-{sid}/thumbnails/poster.jpg"
+    return f"{CONFIG.base_url}/{url.lstrip('/')}" if url.startswith("/") else url
+
+def normalize_show_name(name: str) -> str:
+    if not name: return ""
+    return unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode("utf-8").title().replace("'S", "'s")
+
+def safe_parse_datetime(date_str: str) -> Optional[datetime]:
+    if not date_str: return None
+    formats = ["%Y%m%d%H%M", "%Y-%m-%d %H:%M", "%Y%m%d", "%d/%m/%Y %H:%M"]
+    for fmt in formats:
+        try:
+            return datetime.strptime(str(date_str).strip(), fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+# =========================
+# Template optimisé avec cache LRU
+# =========================
+class OptimizedTemplateEngine:
+    def __init__(self):
+        self.env = Environment(loader=BaseLoader(), autoescape=select_autoescape(["html", "xml"]), optimized=True)
+        self._setup_filters()
+
+    def _setup_filters(self):
+        def jinja_format_date(dt_str: str) -> str:
+            dt = safe_parse_datetime(dt_str)
+            if not dt: return dt_str or ""
+            months = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre']
+            return f"{dt.day} {months[dt.month - 1]}\n{dt.strftime('%H:%M')}"
+        def jinja_show_link(indexer: Any, show_id: Any) -> str:
+            return f"{CONFIG.base_url}/home/view-show?tvid_prodid={indexer}:{show_id}"
+        self.env.filters['format_date'] = jinja_format_date
+        self.env.filters['show_link'] = jinja_show_link
+
+    @lru_cache(maxsize=CONFIG.template_cache_max_items)
+    def _get_template(self, template_string: str) -> Template:
+        return self.env.from_string(template_string)
+
+    def render(self, template_string: str, **context) -> str:
+        template = self._get_template(template_string)
+        context.setdefault("base_url", CONFIG.base_url)
+        return template.render(**context)
+
+template_engine = OptimizedTemplateEngine()
+
+# =========================
+# Data Service (avec ORM et Cache)
+# =========================
+class DataService:
+    @cache_results("shows_data", model=Show)
+    async def get_shows(self) -> List[Show]:
+        async with AsyncSessionFactory() as session:
+            repert = str(Path(CONFIG.db_path).parent) + "/"
+            next_episodes_cte = (
+                select(TVEpisode.showid, TVEpisode.season, func.min(TVEpisode.episode).label("next_episode"))
+                .where(TVEpisode.status.not_in([1, 5, 7]), TVEpisode.season > 0)
+                .group_by(TVEpisode.showid, TVEpisode.season)
+                .cte("next_episodes")
+            )
+            subquery = (
+                select(
+                    TVShow.show_name, TVShow.indexer_id, TVShow.indexer, TVEpisode.season, TVEpisode.episode,
+                    TVEpisode.name, TVEpisode.network,
+                    (TVShow.location + '/fanart.jpg').label("location"),
+                    (f"{repert}cache/images/shows/" + TVShow.indexer.cast(String) + '-' + TVShow.indexer_id.cast(String) + '/fanart').label("showid"),
+                    func.row_number().over(partition_by=TVShow.show_name, order_by=[TVEpisode.season, TVEpisode.episode]).label("rn")
+                )
+                .join(TVEpisode, TVShow.indexer_id == TVEpisode.showid)
+                .join(next_episodes_cte, (TVEpisode.showid == next_episodes_cte.c.showid) & (TVEpisode.season == next_episodes_cte.c.season) & (TVEpisode.episode == next_episodes_cte.c.next_episode))
+                .where(TVEpisode.status.not_in([1, 5, 7]), TVEpisode.season > 0)
+                .distinct().subquery("ranked_episodes")
+            )
+            stmt = (
+                select(
+                    subquery.c.show_name.label("Emission"), subquery.c.season.label("Saison"), subquery.c.episode.label("Episode"),
+                    subquery.c.name.label("Nom_episode"), subquery.c.network.label("Reseau_de_streaming"), subquery.c.location.label("Location"),
+                    subquery.c.showid.label("Showid"), subquery.c.indexer_id.label("show_id"), subquery.c.indexer.label("indexer_id")
+                )
+                .where(subquery.c.rn == 1).order_by(func.lower(subquery.c.show_name))
+            )
+            result = await session.execute(stmt)
+            rows = result.mappings().all()
+            shows = [Show.model_validate(row) for row in rows]
+            for show in shows:
+                if show.indexer_id and show.show_id:
+                    show.thumbnail = f"{CONFIG.base_url}/cache/images/shows/{show.indexer_id}-{show.show_id}/thumbnails/poster.jpg"
+            return shows
+
+    @cache_results("missing_episodes", model=MissingEpisode)
+    async def get_missing_episodes(self) -> List[MissingEpisode]:
+        async with AsyncSessionFactory() as session:
+            season_str = case((TVEpisode.season < 10, '0' + TVEpisode.season.cast(String)), else_=TVEpisode.season.cast(String))
+            episode_str = case((TVEpisode.episode < 10, '0' + TVEpisode.episode.cast(String)), else_=TVEpisode.episode.cast(String))
+            manquant_expr = TVShow.show_name + ' S' + season_str + 'E' + episode_str
+            stmt = (
+                select(
+                    distinct(manquant_expr).label("manquant"), TVShow.indexer_id.label("show_id"), TVShow.indexer.label("indexer_id"),
+                    (f"{CONFIG.base_url}/cache/images/shows/" + TVShow.indexer.cast(String) + '-' + TVShow.indexer_id.cast(String) + '/thumbnails/poster.jpg').label("thumbnail"),
+                    TVEpisode.airdate
+                )
+                .join(TVEpisode, TVShow.indexer_id == TVEpisode.showid, isouter=True)
+                .where(TVEpisode.status.not_in([1, 5, 7]), TVEpisode.status < 100, TVEpisode.season != 0, TVEpisode.file_size == 0)
+                .order_by("manquant")
+            )
+            result = await session.execute(stmt)
+            rows = result.mappings().all()
+            missing = [MissingEpisode.model_validate(row) for row in rows]
+            missing.sort(key=lambda x: x.airdate or float('inf'))
+            return missing
+
+    @cache_results("ended_shows", model=EndedShowData)
+    async def get_ended_shows(self) -> EndedShowData:
+        async with AsyncSessionFactory() as session:
+            stmt = (select(TVShow.indexer_id, TVShow.indexer).where(TVShow.status == 'Ended').order_by(TVShow.show_name))
+            result = await session.execute(stmt)
+            rows = result.all()
+            image_urls = []
+            image_links = []
+            for row in rows:
+                indexer_id, show_id = row
+                if indexer_id and show_id:
+                    image_urls.append(f"{CONFIG.base_url}/cache/images/shows/{show_id}-{indexer_id}/thumbnails/poster.jpg")
+                    image_links.append(f"{CONFIG.base_url}/home/view-show?tvid_prodid={show_id}:{indexer_id}")
+            return EndedShowData(urls=image_urls, links=image_links)
+
+data_service = DataService()
+
+# =========================
+# Background image cache avec opérations async
+# =========================
+class BackgroundCache:
+    def __init__(self):
+        self.cache: Optional[str] = None
+        self.last_update: Optional[datetime] = None
+        self.update_interval = timedelta(minutes=CONFIG.bg_update_min)
+
+    async def refresh(self):
+        """Tâche de fond pour rafraîchir le cache"""
+        try:
+            prochaines_emissions = await data_service.get_shows()
+            repertoire = str(Path(CONFIG.db_path).parent) + "/"
+            await self._update_background(prochaines_emissions, repertoire)
+        except Exception as e:
+            print(f"Background cache refresh failed: {e}")
+
+    async def _update_background(self, prochaines_emissions: List[Show], repertoire: str):
+        if not prochaines_emissions:
+            self.cache = ""
+            self.last_update = datetime.now()
+            return
+
+        sample = random.sample(prochaines_emissions, k=min(len(prochaines_emissions), 10))
+        for s in sample:
+            showid_path = s.Showid
+            if not showid_path:
+                continue
+
+            showdir = Path(showid_path)
+            if not await aiofiles.os.path.exists(showdir):
+                continue
+
+            try:
+                files = []
+                # Correction ici : utiliser os.scandir au lieu de aiofiles.os.scandir
+                for entry in os.scandir(showdir):
+                    if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        files.append(entry.path)
+                        if len(files) >= CONFIG.background_sample_limit:
+                            break
+
+                if files:
+                    chosen = random.choice(files)
+                    self.cache = chosen.replace(repertoire, CONFIG.base_url + "/").replace("\\", "/")
+                    self.last_update = datetime.now()
+                    return
+            except Exception:
+                continue
+
+        self.cache = ""
+        self.last_update = datetime.now()
+
+    async def get_background(self, prochaines_emissions: List[Show], repertoire: str) -> str:
+        now = datetime.now()
+        if self.cache and self.last_update and (now - self.last_update < self.update_interval):
+            return self.cache
+
+        if not prochaines_emissions:
+            self.cache = ""
+            self.last_update = now
+            return self.cache
+
+        # Mise à jour synchrone si nécessaire
+        await self._update_background(prochaines_emissions, repertoire)
+        return self.cache
+
+background_cache = BackgroundCache()
+
+# =========================
+# HTTP helper avec connection pooling
+# =========================
+class HTTPClientManager:
+    def __init__(self):
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def get_client(self) -> httpx.AsyncClient:
+        if self.client is None:
+            self.client = httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_keepalive_connections=CONFIG.httpx_max_keepalive,
+                    max_connections=CONFIG.httpx_max_connections
+                ),
+                timeout=CONFIG.httpx_timeout_s
+            )
+        return self.client
+
+    async def close(self):
+        if self.client:
+            await self.client.aclose()
+            self.client = None
+
+http_client_manager = HTTPClientManager()
+
+async def http_get(url: str) -> Optional[str]:
+    client = await http_client_manager.get_client()
+    for attempt in range(CONFIG.httpx_retries + 1):
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.text
+        except httpx.RequestError:
+            if attempt >= CONFIG.httpx_retries:
+                return None
+            await asyncio.sleep(0.5 * (2 ** attempt))
+    return None
+
+class OptimizedHTMLParser:
+    def parse_html(self, html_content: str) -> BeautifulSoup:
+        return BeautifulSoup(html_content, 'lxml' if LXML_AVAILABLE else 'html.parser')
+    def validate_structure(self, soup: BeautifulSoup) -> bool:
+        return bool(soup.find(['div', 'body', 'html']))
+
+html_parser = OptimizedHTMLParser()
+
+@cache_results("schedule_data")
+async def get_cached_schedule():
+    html_content = await http_get(f"{CONFIG.base_url}/daily-schedule/")
+    if not html_content:
+        return []
+    soup = html_parser.parse_html(html_content)
+    if not html_parser.validate_structure(soup):
+        return []
+    data = []
+    for show in soup.select(".daybyday-show"):
+        if show.select_one(".over-layer0, .over-layer1"):
+            continue
+        name = show.get("data-name", "")
+        time_raw = show.get("data-time", "")
+        img = show.select_one("img")
+        poster_url = img.get("src") if img else ""
+        if name and time_raw and poster_url:
+            data.append({"name": name, "time": time_raw, "poster": poster_url})
+    return data
+
+# =========================
+# Template HTML
+# =========================
+template_string = """<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Émissions TV à venir</title><link rel="icon" type="image/x-icon" href="{{ base_url }}/images/ico/favicon.ico"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap" rel="stylesheet"><style>*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}:root{--bg-primary:#0a0a0f;--bg-secondary:#13131a;--bg-tertiary:#1a1a24;--bg-card:#16161f;--bg-hover:#1d1d28;--border-subtle:#252530;--border-light:#2a2a38;--text-primary:#e8e8f0;--text-secondary:#a8a8b8;--text-muted:#6a6a78;--accent-blue:#4a9eff;--accent-cyan:#3dd9eb;--shadow-sm:0 1px 3px rgba(0,0,0,0.3);--shadow-md:0 4px 12px rgba(0,0,0,0.4);--shadow-lg:0 8px 24px rgba(0,0,0,0.5);--transition-fast:150ms cubic-bezier(0.4,0,0.2,1);--transition-base:250ms cubic-bezier(0.4,0,0.2,1);--card-border-radius:8px}body{font-family:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',sans-serif;margin:0;padding:0;background:linear-gradient(135deg,#0a0a0f 0%,#13131a 50%,#0f0f16 100%);background-attachment:fixed;min-height:100vh;color:var(--text-primary);line-height:1.6;-webkit-font-smoothing:antialiased}body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;background-image:url("{{ bg_file }}");background-repeat:no-repeat;background-position:center;background-size:cover;opacity:0.03;z-index:-1;animation:subtle-shift 60s ease-in-out infinite alternate}@keyframes subtle-shift{0%{transform:scale(1) translateY(0)}100%{transform:scale(1.05) translateY(-10px)}}.content-wrapper{position:relative;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:2rem 0}.main-content{width:100%;max-width:1280px;padding:0 1.5rem}h1{color:var(--accent-cyan);text-align:center;font-weight:300;font-size:2.5rem;margin:1.5rem 0;letter-spacing:1px;position:relative;padding-bottom:10px}h1::after{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:60px;height:3px;background-color:var(--accent-blue);border-radius:3px}.page-precedente{margin-bottom:1.5rem}.page-precedente a{color:var(--text-secondary);text-decoration:none;font-size:0.9rem;font-weight:500;transition:var(--transition-base);display:inline-flex;align-items:center;gap:0.5rem;padding:0.5rem 1rem;border-radius:6px;border:1px solid var(--border-subtle);background:var(--bg-secondary)}.page-precedente a::before{content:'←';font-size:1rem;transition:var(--transition-fast)}.page-precedente a:hover{color:var(--accent-blue);border-color:var(--border-light);background:var(--bg-tertiary);transform:translateX(-2px)}.page-precedente a:hover::before{transform:translateX(-2px)}.card{background:var(--bg-card);border-radius:var(--card-border-radius);border:1px solid var(--border-subtle);margin-bottom:25px;overflow:hidden;box-shadow:var(--shadow-md);transition:var(--transition-base)}.card:hover{border-color:var(--border-light);box-shadow:var(--shadow-lg)}.card-header{padding:16px 20px;border-bottom:1px solid var(--border-subtle);background:linear-gradient(180deg,var(--bg-secondary) 0%,var(--bg-card) 100%);text-align:center}.card-header h2{margin:0;color:var(--accent-cyan);font-weight:400;font-size:1.5rem}.card-content{padding:15px}.grid-container{display:grid;gap:0;width:100%;margin:20px auto;border-radius:var(--card-border-radius);overflow:hidden;box-shadow:var(--shadow-md);background-color:var(--bg-card)}.show-grid{grid-template-columns:auto 1fr auto auto auto auto}.grid-header-row{display:contents}.grid-header{font-weight:600;padding:1rem 0.8rem;color:var(--text-secondary);letter-spacing:0.5px;font-size:0.95rem;text-transform:uppercase;display:flex;justify-content:center;align-items:center;text-align:center;background:var(--bg-secondary)}.grid-item{padding:0.7rem 0.8rem;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;min-height:65px;justify-content:center;text-align:center;transition:var(--transition-fast);color:var(--text-secondary)}.grid-item:nth-child(6n+2){justify-content:flex-start;text-align:left;color:var(--text-primary)}.show-row{display:contents}.show-row:hover .grid-item{background-color:var(--bg-hover);cursor:pointer}.show-thumbnail{width:45px;height:68px;border-radius:4px;object-fit:cover;transition:var(--transition-base);box-shadow:var(--shadow-sm);border:1px solid var(--border-subtle)}.show-thumbnail:hover{transform:scale(1.7);z-index:10;border-color:var(--accent-blue)}.missing-episodes-table{width:100%;max-width:600px;margin:0 auto;border-collapse:separate;border-spacing:0}.missing-episodes-table tr{display:flex;align-items:center;transition:background-color 0.2s}.missing-episodes-table tr:hover{background-color:var(--bg-hover)}.missing-episodes-table td{padding:8px;border-bottom:1px solid var(--border-subtle);color:var(--text-secondary)}.missing-episodes-table tr:last-child td{border-bottom:none}.missing-episodes-table td:first-child{width:55px;padding-right:15px}.missing-episodes-table td:last-child{flex:1;color:var(--text-primary)}.flex-center{display:flex;flex-wrap:wrap;justify-content:center;gap:20px;margin-top:20px}.show-cards{display:flex;flex-wrap:wrap;justify-content:center;gap:20px;padding:20px}.show-card{width:200px;transition:var(--transition-base)}.show-card:hover{transform:translateY(-4px)}.show-poster{position:relative;overflow:hidden;border-radius:var(--card-border-radius) var(--card-border-radius) 0 0;box-shadow:var(--shadow-md);height:293px;background:var(--bg-secondary)}.show-poster::before{content:'';position:absolute;inset:0;background:linear-gradient(180deg,transparent 50%,rgba(10,10,15,0.9) 100%);z-index:1;pointer-events:none}.show-poster img{width:100%;height:100%;object-fit:cover;transition:var(--transition-base)}.show-poster:hover img{transform:scale(1.05)}.show-date{position:absolute;left:0;right:0;bottom:0;color:var(--text-primary);text-align:center;padding:0.75rem;font-size:0.95rem;font-weight:500;white-space:pre-line;z-index:2;letter-spacing:-0.01em}.show-info{padding:10px 0;text-align:center;background:var(--bg-secondary);border-radius:0 0 var(--card-border-radius) var(--card-border-radius);border:1px solid var(--border-subtle);border-top:none}.show-info h3{margin:0;font-size:1rem;font-weight:500;color:var(--text-secondary)}.image-container{position:relative;overflow:hidden;border-radius:var(--card-border-radius);box-shadow:var(--shadow-md);transition:var(--transition-base);border:1px solid var(--border-subtle)}.image-container img{width:200px;height:293px;transition:var(--transition-base);object-fit:cover}.image-container:hover{transform:translateY(-5px);box-shadow:var(--shadow-lg);border-color:var(--border-light)}.image-container:hover img{opacity:0.9}@media (max-width:1024px){.show-grid{grid-template-columns:auto 1fr auto auto}.grid-header:nth-child(5),.grid-header:nth-child(6),.grid-item:nth-of-type(6n-1),.grid-item:nth-of-type(6n){display:none}}@media (max-width:768px){h1{font-size:2rem}.show-grid{grid-template-columns:1fr}.grid-header{display:none}.grid-item{display:grid;grid-template-columns:auto 1fr;gap:1rem;padding:1rem;justify-content:unset;text-align:left}.show-card{width:calc(50% - 15px)}.show-poster{height:auto;aspect-ratio:2 / 3}.show-cards{gap:30px}}</style></head><body><div class="content-wrapper"><div class="main-content"><div class="page-precedente"><a href="javascript:history.back()">Page précédente</a></div><div class="card"><div class="card-header"><h2>Prochaines émissions à écouter</h2></div><div class="card-content"><div class="grid-container show-grid"><div class="grid-header-row"><div class="grid-header"></div><div class="grid-header">Émission</div><div class="grid-header">Saison</div><div class="grid-header">Épisode</div><div class="grid-header">Nom de l'épisode</div><div class="grid-header">Réseau</div></div>{% for emission in prochaines_emissions %}<div class="show-row"><div class="grid-item"><a href="{{ emission.indexer_id|show_link(emission.show_id) }}"><img src="{{ emission.thumbnail }}" class="show-thumbnail" alt="{{ emission.Emission }}" loading="lazy"></a></div><div class="grid-item"><a href="{{ emission.indexer_id|show_link(emission.show_id) }}" style="color:inherit;text-decoration:none">{{ emission.Emission }}</a></div><div class="grid-item">{{ emission.Saison }}</div><div class="grid-item">{{ emission.Episode }}</div><div class="grid-item">{{ emission.Nom_episode }}</div><div class="grid-item">{% if emission.Reseau_de_streaming %}<img src="{{ base_url }}/cache/images/network/{{ emission.Reseau_de_streaming|lower }}.png" alt="{{ emission.Reseau_de_streaming }}" title="{{ emission.Reseau_de_streaming }}" style="max-height:30px;max-width:100%" loading="lazy">{% endif %}</div></div>{% endfor %}</div></div></div>{% if manq %}<div class="card"><div class="card-header"><h2>Épisodes manquants</h2></div><div class="card-content"><table class="missing-episodes-table">{% for emission in manq %}<tr><td><a href="{{ emission.indexer_id|show_link(emission.show_id) }}"><img src="{{ emission.thumbnail }}" class="show-thumbnail" alt="{{ emission.manquant }}" loading="lazy"></a></td><td>{{ emission.manquant }}</td></tr>{% endfor %}</table></div></div>{% endif %}{% if image_urls %}<div class="card"><div class="card-header"><h2>Émissions annulées</h2></div><div class="card-content"><div class="flex-center">{% for i in range(image_urls|length) %}<div class="image-container"><a href="{{ image_links[i] }}"><img src="{{ image_urls[i] }}" alt="Emission annulée" loading="lazy"></a></div>{% endfor %}</div></div></div>{% endif %}{% if next_show %}<div class="card"><div class="card-header"><h2>Épisodes à venir</h2></div><div class="card-content"><div class="show-cards">{% for next_s in next_show %}<div class="show-card"><div class="show-poster"><a href="{{ next_s.indexer_id|show_link(next_s.show_id) }}"><img src="{{ next_s.Image }}" alt="{{ next_s.Emission }}" loading="lazy"><div class="show-date">{{ next_s.Date_diffusion|format_date }}</div></a></div><div class="show-info"><h3>{{ next_s.Emission }}</h3></div></div>{% endfor %}</div></div></div>{% endif %}</div></div><script>document.addEventListener('DOMContentLoaded',function(){document.querySelectorAll('.show-row').forEach(row=>{const link=row.querySelector('a');if(link){const url=link.getAttribute('href');row.style.cursor='pointer';row.addEventListener('click',e=>{if(e.target.tagName!=='A'&&e.target.tagName!=='IMG')window.location.href=url;});}});});</script></body></html>"""
+
+# =========================
+# FastAPI app & lifespan
+# =========================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global CONFIG
+    # Charger la configuration au démarrage
+    CONFIG = load_config()
+
+    # Initialiser le client HTTP
+    await http_client_manager.get_client()
+
+    if redis_client:
+        try:
+            await redis_client.ping()
+        except Exception:
             pass
 
-    def start(self):
-        global is_win
-        # do some preliminary stuff
-        sickgear.MY_FULLNAME = os.path.normpath(os.path.abspath(__file__))
-        sickgear.PROG_DIR = os.path.dirname(sickgear.MY_FULLNAME)
-        sickgear.DATA_DIR = sickgear.PROG_DIR
-        sickgear.MY_ARGS = sys.argv[1:]
-        sickgear.SYS_ENCODING = SYS_ENCODING
-        legacy_runner = globals().get('_legacy_sickgear_runner')
-        if not legacy_runner:
-            import __main__
-            legacy_runner = 'bear' in (getattr(__main__, '__file__', False) or '').split(os.sep)[-1].lower()
-        sickgear.MEMCACHE['DEPRECATE_SB_RUNNER'] = legacy_runner
+    yield
 
-        # Need console logging for sickgear.py
-        self.console_logging = not hasattr(sys, 'frozen')
+    # Nettoyage
+    await http_client_manager.close()
+    if redis_client:
+        await redis_client.close()
+    await engine.dispose()
 
-        # Rename the main thread
-        threading.current_thread().name = 'MAIN'
+app = FastAPI(title="SickGear - FastAPI", lifespan=lifespan)
+if CONFIG.enable_gzip:
+    app.add_middleware(
+        GZipMiddleware,
+        minimum_size=CONFIG.gzip_min_size,
+        compresslevel=CONFIG.gzip_compress_level
+    )
 
-        try:
-            opts, args = getopt.getopt(sys.argv[1:], 'hfqdsp::',
-                                       ['help', 'forceupdate', 'quiet', 'nolaunch', 'daemon', 'systemd', 'pidfile=',
-                                        'port=', 'datadir=', 'config=', 'noresize', 'update-restart', 'update-pkg'])
-        except getopt.GetoptError:
-            sys.exit(self.help_message())
+# =========================
+# Routes avec configuration dynamique
+# =========================
+@app.get("/", response_class=HTMLResponse)
+async def ecouter(background_tasks: BackgroundTasks):
+    repertoire = str(Path(CONFIG.db_path).parent) + "/"
 
-        for o, a in opts:
-            # Prints help message
-            if o in ('-h', '--help'):
-                sys.exit(self.help_message())
+    # Ajouter la tâche de fond pour rafraîchir le cache
+    background_tasks.add_task(background_cache.refresh)
 
-            # For now, we'll just silence the logging
-            if o in ('-q', '--quiet'):
-                self.console_logging = False
+    # Récupérer les données
+    prochaines_emissions = await data_service.get_shows()
+    manq = await data_service.get_missing_episodes()
+    ended_shows_data = await data_service.get_ended_shows()
 
-            # Should we update (from indexer) all shows in the DB right away?
-            if o in ('-f', '--forceupdate'):
-                self.force_update = True
-
-            # Suppress launching web browser
-            # Needed for OSes without default browser assigned
-            # Prevent duplicate browser window when restarting in the app
-            if o in ('--nolaunch',):
-                self.no_launch = True
-
-            # Override default/configured port
-            if o in ('-p', '--port'):
-                try:
-                    self.forced_port = int(a)
-                except ValueError:
-                    sys.exit('Port: %s is not a number. Exiting.' % a)
-
-            # Run as a double forked daemon
-            if o in ('-d', '--daemon'):
-                self.run_as_daemon = True
-                # When running as daemon disable console_logging and don't start browser
-                self.console_logging = False
-                self.no_launch = True
-
-                if is_win:
-                    self.run_as_daemon = False
-
-            # Run as a systemd service
-            if o in ('-s', '--systemd') and not is_win:
-                self.run_as_systemd = True
-                self.run_as_daemon = False
-                self.console_logging = False
-                self.no_launch = True
-
-            # Write a pidfile if requested
-            if o in ('--pidfile',):
-                self.create_pid = True
-                self.pid_file = str(a)
-
-                # If the pidfile already exists, sickgear may still be running, so exit
-                if os.path.exists(self.pid_file):
-                    sys.exit('PID file: %s already exists. Exiting.' % self.pid_file)
-
-            # Specify folder to load the config file from
-            if o in ('--config',):
-                sickgear.CONFIG_FILE = os.path.abspath(a)
-
-            # Specify folder to use as the data dir
-            if o in ('--datadir',):
-                sickgear.DATA_DIR = os.path.abspath(a)
-
-            # Prevent resizing of the banner/posters even if PIL is installed
-            if o in ('--noresize',):
-                sickgear.NO_RESIZE = True
-
-        # The pidfile is only useful in daemon mode, make sure we can write the file properly
-        if self.create_pid:
-            if self.run_as_daemon:
-                pid_dir = os.path.dirname(self.pid_file)
-                if not os.access(pid_dir, os.F_OK):
-                    sys.exit(f"PID dir: {pid_dir} doesn't exist. Exiting.")
-                if not os.access(pid_dir, os.W_OK):
-                    sys.exit(f'PID dir: {pid_dir} must be writable (write permissions). Exiting.')
-
-            else:
-                if self.console_logging:
-                    print('Not running in daemon mode. PID file creation disabled')
-
-                self.create_pid = False
-
-        # If they don't specify a config file then put it in the data dir
-        if not sickgear.CONFIG_FILE:
-            sickgear.CONFIG_FILE = os.path.join(sickgear.DATA_DIR, 'config.ini')
-
-        # Make sure that we can create the data dir
-        if not os.access(sickgear.DATA_DIR, os.F_OK):
-            try:
-                os.makedirs(sickgear.DATA_DIR, 0o744)
-            except os.error:
-                sys.exit(f'Unable to create data directory: {sickgear.DATA_DIR} Exiting.')
-
-        # Make sure we can write to the data dir
-        if not os.access(sickgear.DATA_DIR, os.W_OK):
-            sys.exit(f'Data directory: {sickgear.DATA_DIR} must be writable (write permissions). Exiting.')
-
-        # Make sure we can write to the config file
-        if not os.access(sickgear.CONFIG_FILE, os.W_OK):
-            if os.path.isfile(sickgear.CONFIG_FILE):
-                sys.exit(f'Config file: {sickgear.CONFIG_FILE} must be writeable (write permissions). Exiting.')
-            elif not os.access(os.path.dirname(sickgear.CONFIG_FILE), os.W_OK):
-                sys.exit(f'Config file directory: {os.path.dirname(sickgear.CONFIG_FILE)}'
-                         f' must be writeable (write permissions). Exiting')
-        os.chdir(sickgear.DATA_DIR)
-
-        if self.console_logging:
-            print(f'Starting up SickGear from {sickgear.CONFIG_FILE}')
-
-        # Load the config and publish it to the sickgear package
-        if not os.path.isfile(sickgear.CONFIG_FILE):
-            print(f'Unable to find "{sickgear.CONFIG_FILE}", all settings will be default!')
-
-        sickgear.CFG = ConfigObj(sickgear.CONFIG_FILE)
-        try:
-            stack_size = int(sickgear.CFG['General']['stack_size'])
-        except (BaseException, Exception):
-            stack_size = None
-
-        if stack_size:
-            try:
-                threading.stack_size(stack_size)
-            except (BaseException, Exception) as er:
-                print('Stack Size %s not set: %s' % (stack_size, ex(er)))
-
-        if self.run_as_daemon:
-            self.daemonize()
-
-        # Get PID
-        sickgear.PID = os.getpid()
-
-        # Initialize the config
-        sickgear.initialize(console_logging=self.console_logging)
-
-        if self.forced_port:
-            logger.log(f'Forcing web server to port {self.forced_port}')
-            self.start_port = self.forced_port
-        else:
-            self.start_port = sickgear.WEB_PORT
-
-        if sickgear.WEB_LOG:
-            self.log_dir = sickgear.LOG_DIR
-        else:
-            self.log_dir = None
-
-        # sickgear.WEB_HOST is available as a configuration value in various
-        # places but is not configurable. It is supported here for historic reasons.
-        if sickgear.WEB_HOST and '0.0.0.0' != sickgear.WEB_HOST:
-            self.webhost = sickgear.WEB_HOST
-        else:
-            self.webhost = (('0.0.0.0', '::')[sickgear.WEB_IPV6], '')[sickgear.WEB_IPV64]
-
-        # web server options
-        self.web_options = dict(
-            host=self.webhost,
-            port=int(self.start_port),
-            web_root=sickgear.WEB_ROOT,
-            data_root=os.path.join(sickgear.PROG_DIR, 'gui', sickgear.GUI_NAME),
-            log_dir=self.log_dir,
-            username=sickgear.WEB_USERNAME,
-            password=sickgear.WEB_PASSWORD,
-            handle_reverse_proxy=sickgear.HANDLE_REVERSE_PROXY,
-            enable_https=False,
-            https_cert=None,
-            https_key=None,
-        )
-        if sickgear.ENABLE_HTTPS:
-            self.web_options.update(dict(
-                enable_https=sickgear.ENABLE_HTTPS,
-                https_cert=os.path.join(sickgear.PROG_DIR, sickgear.HTTPS_CERT),
-                https_key=os.path.join(sickgear.PROG_DIR, sickgear.HTTPS_KEY)
+    schedule_data = await get_cached_schedule()
+    next_show = []
+    if schedule_data:
+        seen, now, processed_schedule = set(), datetime.now(), []
+        for item in schedule_data:
+            name = normalize_show_name(item.get("name"))
+            if name in seen:
+                continue
+            seen.add(name)
+            dt_obj = safe_parse_datetime(item.get("time"))
+            if dt_obj and dt_obj < now:
+                continue
+            processed_schedule.append({"name": name, "dt_obj": dt_obj, "dt_raw": item.get("time"), "poster": format_image_url_from_raw(item.get("poster"))})
+        processed_schedule.sort(key=lambda x: x["dt_obj"] or datetime.max)
+        for p in processed_schedule:
+            idx, sid = extract_indexer_showid_from_url(p["poster"])
+            next_show.append(UpcomingShow(
+                Emission=p["name"],
+                Date_diffusion=p["dt_obj"].strftime("%Y-%m-%d %H:%M") if p["dt_obj"] else p["dt_raw"],
+                Image=p["poster"],
+                indexer_id=idx or "",
+                show_id=sid or ""
             ))
 
-        # start web server
-        try:
-            # used to check if existing SG instances have been started
-            sickgear.helpers.wait_for_free_port(
-                sickgear.WEB_IPV6 and '::1' or self.web_options['host'], self.web_options['port'])
+    bg_file = await background_cache.get_background(prochaines_emissions, repertoire)
+    html_content = template_engine.render(
+        template_string,
+        prochaines_emissions=[s.model_dump() for s in prochaines_emissions],
+        manq=[m.model_dump() for m in manq],
+        image_urls=ended_shows_data.urls,
+        image_links=ended_shows_data.links,
+        next_show=[ns.model_dump() for ns in next_show],
+        bg_file=bg_file,
+    )
+    return HTMLResponse(content=html_content)
 
-            self.webserver = WebServer(options=self.web_options)
-            self.webserver.start()
-            # wait for server thread to be started
-            self.webserver.wait_server_start()
-            sickgear.started = True
-        except (BaseException, Exception):
-            logger.error(f'Unable to start web server, is something else running on port {self.start_port:d}?')
-            if self.run_as_systemd:
-                self.exit(0)
-            if sickgear.LAUNCH_BROWSER and not self.no_launch:
-                logger.error('Launching browser and exiting')
-                sickgear.launch_browser(self.start_port)
-            self.exit(1)
-
-        # Launch browser
-        if sickgear.LAUNCH_BROWSER and not self.no_launch:
-            sickgear.launch_browser(self.start_port)
-
-        # send pid of sg instance to ui
-        sickgear.classes.loading_msg.set_msg_progress('Process-id', sickgear.PID)
-
-        # check all db versions
-        for d, min_v, max_v, base_v, mo in [
-            ('failed.db', sickgear.failed_db.MIN_DB_VERSION, sickgear.failed_db.MAX_DB_VERSION,
-             sickgear.failed_db.TEST_BASE_VERSION, 'FailedDb'),
-            ('cache.db', sickgear.cache_db.MIN_DB_VERSION, sickgear.cache_db.MAX_DB_VERSION,
-             sickgear.cache_db.TEST_BASE_VERSION, 'CacheDb'),
-            ('sickbeard.db', sickgear.mainDB.MIN_DB_VERSION, sickgear.mainDB.MAX_DB_VERSION,
-             sickgear.mainDB.TEST_BASE_VERSION, 'MainDb')
-        ]:
-            cur_db_version = db.DBConnection(d).check_db_version()
-
-            # handling of standalone TEST db versions
-            load_msg = 'Downgrading %s to production version' % d
-            if 100000 <= cur_db_version != max_v:
-                sickgear.classes.loading_msg.set_msg_progress(load_msg, 'Rollback')
-                print('Your [%s] database version (%s) is a test db version and doesn\'t match SickGear required '
-                      'version (%s), downgrading to production db' % (d, cur_db_version, max_v))
-                self.execute_rollback(mo, max_v, load_msg)
-                cur_db_version = db.DBConnection(d).check_db_version()
-                if 100000 <= cur_db_version:
-                    print('Rollback to production failed.')
-                    sys.exit('If you have used other forks, your database may be unusable due to their changes')
-                if 100000 <= max_v and None is not base_v:
-                    max_v = base_v  # set max_v to the needed base production db for test_db
-                print(f'Rollback to production of [{d}] successful.')
-                sickgear.classes.loading_msg.set_msg_progress(load_msg, 'Finished')
-
-            # handling of production version higher than current base of test db
-            if isinstance(base_v, integer_types) and max_v >= 100000 > cur_db_version > base_v:
-                sickgear.classes.loading_msg.set_msg_progress(load_msg, 'Rollback')
-                print('Your [%s] database version (%s) is a db version and doesn\'t match SickGear required '
-                      'version (%s), downgrading to production base db' % (d, cur_db_version, max_v))
-                self.execute_rollback(mo, base_v, load_msg)
-                cur_db_version = db.DBConnection(d).check_db_version()
-                if 100000 <= cur_db_version:
-                    print('Rollback to production base failed.')
-                    sys.exit('If you have used other forks, your database may be unusable due to their changes')
-                if 100000 <= max_v and None is not base_v:
-                    max_v = base_v  # set max_v to the needed base production db for test_db
-                print(f'Rollback to production base of [{d}] successful.')
-                sickgear.classes.loading_msg.set_msg_progress(load_msg, 'Finished')
-
-            # handling of production db versions
-            if 0 < cur_db_version < 100000:
-                if cur_db_version < min_v:
-                    print(f'Your [{d}] database version ({cur_db_version})'
-                          f' is too old to migrate from with this version of SickGear')
-                    sys.exit('Upgrade using a previous version of SG first,'
-                             ' or start with no database file to begin fresh')
-                if cur_db_version > max_v:
-                    sickgear.classes.loading_msg.set_msg_progress(load_msg, 'Rollback')
-                    print(f'Your [{d}] database version ({cur_db_version}) has been incremented past what this'
-                          f' version of SickGear supports. Trying to rollback now. Please wait...')
-                    self.execute_rollback(mo, max_v, load_msg)
-                    if db.DBConnection(d).check_db_version() > max_v:
-                        print('Rollback failed.')
-                        sys.exit('If you have used other forks, your database may be unusable due to their changes')
-                    print(f'Rollback of [{d}] successful.')
-                    sickgear.classes.loading_msg.set_msg_progress(load_msg, 'Finished')
-
-        # migrate the config if it needs it
-        from sickgear.config import ConfigMigrator
-        migrator = ConfigMigrator(sickgear.CFG)
-        if migrator.config_version > migrator.expected_config_version:
-            self.execute_rollback('ConfigFile', migrator.expected_config_version, 'Downgrading config.ini')
-            migrator = ConfigMigrator(sickgear.CFG)
-        migrator.migrate_config()
-
-        # free memory
-        global rollback_loaded
-        rollback_loaded = None
-        sickgear.classes.loading_msg.message = 'Init SickGear'
-
-        # Initialize the threads and other stuff
-        sickgear.initialize(console_logging=self.console_logging)
-
-        # Check if we need to perform a restore first
-        restore_dir = os.path.join(sickgear.DATA_DIR, 'restore')
-        if os.path.exists(restore_dir):
-            sickgear.classes.loading_msg.message = 'Restoring files'
-            if self.restore(restore_dir, sickgear.DATA_DIR):
-                logger.log('Restore successful...')
-            else:
-                logger.log_error_and_exit('Restore FAILED!')
-
-        # refresh network timezones
-        sickgear.classes.loading_msg.message = 'Checking network timezones'
-        network_timezones.update_network_dict()
-
-        update_arg = '--update-restart'
-        manual_update_arg = '--update-pkg'
-        if update_arg not in sickgear.MY_ARGS and sickgear.UPDATES_TODO \
-                and (manual_update_arg in sickgear.MY_ARGS or sickgear.UPDATE_PACKAGES_AUTO):
-            sickgear.MEMCACHE['update_restart'] = piper.pip_update(
-                sickgear.classes.loading_msg, sickgear.UPDATES_TODO, sickgear.DATA_DIR)
-            sickgear.UPDATES_TODO = dict()
-            sickgear.save_config()
-
-        if manual_update_arg in sickgear.MY_ARGS:
-            sickgear.MY_ARGS.remove(manual_update_arg)
-
-        if not sickgear.MEMCACHE.get('update_restart'):
-            # Build from the DB to start with
-            sickgear.classes.loading_msg.message = 'Loading shows from db'
-            sickgear.indexermapper.indexer_list = [i for i in sickgear.TVInfoAPI().all_sources
-                                                   if sickgear.TVInfoAPI(i).config.get('show_url')
-                                                   and True is not sickgear.TVInfoAPI(i).config.get('people_only')]
-            self.load_shows_from_db()
-            sickgear.MEMCACHE['history_tab'] = sickgear.webserve.History.menu_tab(
-                sickgear.MEMCACHE['history_tab_limit'])
-            if not db.DBConnection().has_flag('ignore_require_cleaned'):
-                from sickgear.show_updater import clean_ignore_require_words
-                sickgear.classes.loading_msg.message = 'Cleaning ignore/require words lists'
-                clean_ignore_require_words()
-                db.DBConnection().set_flag('ignore_require_cleaned')
-
-        # Fire up threads
-        sickgear.classes.loading_msg.message = 'Starting threads'
-        sickgear.start()
-
-        if sickgear.MEMCACHE.get('update_restart'):
-            sickgear.MY_ARGS.append(update_arg)
-            sickgear.classes.loading_msg.message = 'Restarting SickGear after update'
-            time.sleep(3)
-            sickgear.restart(soft=False)
-            # restart wait loop
-            while True:
-                time.sleep(1)
-
-        if update_arg in sickgear.MY_ARGS:
-            sickgear.MY_ARGS.remove(update_arg)
-
-        # Build internal name cache
-        sickgear.classes.loading_msg.message = 'Build name cache'
-        name_cache.build_name_cache()
-
-        # load all ids from xem
-#        sickgear.classes.loading_msg.message = 'Loading xem data'
-#        startup_background_tasks = threading.Thread(name='XEMUPDATER', target=sickgear.scene_exceptions.ReleaseMap().fetch_xem_ids)
-#        startup_background_tasks.start()
-
-        sickgear.classes.loading_msg.message = 'Checking history'
-        # check history snatched_proper update
-        if not db.DBConnection().has_flag('history_snatch_proper'):
-            # noinspection PyUnresolvedReferences
-            history_snatched_proper_task = threading.Thread(name='UPGRADE-HISTORY-ACTION',
-                                                            target=sickgear.history.history_snatched_proper_fix)
-            history_snatched_proper_task.start()
-
-        if not db.DBConnection().has_flag('kodi_nfo_default_removed'):
-            sickgear.metadata.kodi.remove_default_attr()
-        if not db.DBConnection().has_flag('kodi_nfo_rebuild_uniqueid'):
-            sickgear.metadata.kodi.rebuild_nfo()
-
-        my_db = db.DBConnection()
-        sql_result = my_db.select('SELECT * FROM tv_src_switch WHERE status = 0')
-        if sql_result:
-            switching = True
-            l_msg = 'Adding shows that are switching tv source to queue'
-            total_result = len(sql_result)
-
-            def q_switch(switch):
-                try:
-                    _show_obj = sickgear.helpers.find_show_by_id({switch['new_indexer']: switch['new_indexer_id']})
-                    if _show_obj:
-                        sickgear.show_queue_scheduler.action.switch_show(
-                            show_obj=_show_obj,
-                            new_tvid=switch['new_indexer'], new_prodid=switch['new_indexer_id'],
-                            force_id=bool(switch['force_id']), uid=switch['uid'],
-                            set_pause=bool(switch['set_pause']), mark_wanted=bool(switch['mark_wanted']), resume=True,
-                            old_tvid=switch['old_indexer'], old_prodid=switch['old_indexer_id']
-                        )
-                except (BaseException, Exception):
-                    pass
-
-            sickgear.classes.loading_msg.set_msg_progress(l_msg, '0/%s' % total_result)
-            for i, cur_switch in enumerate(sql_result, 1):
-                sickgear.classes.loading_msg.set_msg_progress(l_msg, '%s/%s' % (i, total_result))
-                try:
-                    show_obj = sickgear.helpers.find_show_by_id(
-                        {cur_switch['old_indexer']: cur_switch['old_indexer_id']})
-                except (BaseException, Exception):
-                    if cur_switch['new_indexer_id']:
-                        # show id was already switched, but not finished updated, so queue as update
-                        q_switch(cur_switch)
-                    continue
-                if show_obj:
-                    try:
-                        sickgear.show_queue_scheduler.action.switch_show(
-                            show_obj=show_obj,
-                            new_tvid=cur_switch['new_indexer'], new_prodid=cur_switch['new_indexer_id'],
-                            force_id=bool(cur_switch['force_id']), uid=cur_switch['uid'],
-                            set_pause=bool(cur_switch['set_pause']), mark_wanted=bool(cur_switch['mark_wanted'])
-                        )
-                    except (BaseException, Exception):
-                        continue
-                elif cur_switch['new_indexer_id']:
-                    # show id was already switched, but not finished updated, so resume
-                    q_switch(cur_switch)
-        else:
-            switching = False
-
-        # Start an update if we're supposed to
-        if not switching and (self.force_update or sickgear.UPDATE_SHOWS_ON_START):
-            sickgear.classes.loading_msg.message = 'Starting a forced show update'
-            background_start_forced_show_update = threading.Thread(name='STARTUP-FORCE-SHOW-UPDATE',
-                                                                   target=sickgear.update_show_scheduler.action.run)
-            background_start_forced_show_update.start()
-
-        sickgear.classes.loading_msg.message = 'Switching to default web server'
-        time.sleep(2)
-        self.webserver.switch_handlers()
-
-        # main loop
-        while 1:
-            time.sleep(1)
-
-    def daemonize(self):
-        """
-        Fork off as a daemon
-        """
-        # pylint: disable=E1101
-        # Make a non-session-leader child process
-        try:
-            pid = os.fork()  # only available in UNIX
-            if 0 != pid:
-                self.exit(0)
-        except OSError as er:
-            sys.stderr.write('fork #1 failed: %d (%s)\n' % (er.errno, er.strerror))
-            sys.exit(1)
-
-        os.setsid()  # only available in UNIX
-
-        # Make sure I can read my own files and shut out others
-        prev = os.umask(0)
-        os.umask(prev and int('077', 8))
-
-        # Make the child a session-leader by detaching from the terminal
-        try:
-            pid = os.fork()  # only available in UNIX
-            if 0 != pid:
-                self.exit(0)
-        except OSError as er:
-            sys.stderr.write('fork #2 failed: %d (%s)\n' % (er.errno, er.strerror))
-            sys.exit(1)
-
-        # Write pid
-        if self.create_pid:
-            pid = str(os.getpid())
-            logger.log(f'Writing PID: {pid} to {self.pid_file}')
-            try:
-                os.fdopen(os.open(self.pid_file, os.O_CREAT | os.O_WRONLY, 0o644), 'w').write('%s\n' % pid)
-            except (BaseException, Exception) as er:
-                logger.log_error_and_exit('Unable to write PID file: %s Error: %s [%s]' % (
-                    self.pid_file, er.strerror, er.errno))
-
-        # Redirect all output
-        sys.stdout.flush()
-        sys.stderr.flush()
-
-        devnull = getattr(os, 'devnull', '/dev/null')
-        stdin = open(devnull, 'r')
-        stdout = open(devnull, 'a+')
-        stderr = open(devnull, 'a+')
-        os.dup2(stdin.fileno(), sys.stdin.fileno())
-        os.dup2(stdout.fileno(), sys.stdout.fileno())
-        os.dup2(stderr.fileno(), sys.stderr.fileno())
-
-    @staticmethod
-    def remove_pid_file(pidfile):
-        try:
-            if os.path.exists(pidfile):
-                os.remove(pidfile)
-
-        except (IOError, OSError):
-            return False
-
-        return True
-
-    @staticmethod
-    def load_shows_from_db():
-        """
-        Populates the showList with shows from the database
-        """
-
-        logger.log('Loading initial show list')
-
-        my_db = db.DBConnection(row_type='dict')
-        sql_result = my_db.select(
-            """
-            SELECT tv_shows.indexer AS tv_id, tv_shows.indexer_id AS prod_id, tv_shows.*,
-             ii.akas AS ii_akas, 
-             ii.certificates AS ii_certificates,
-             ii.countries AS ii_countries, ii.country_codes AS ii_country_codes,
-             ii.genres AS ii_genres, ii.imdb_id AS ii_imdb_id,
-             ii.indexer AS ii_indexer, ii.indexer_id AS ii_indexer_id,
-             ii.last_update AS ii_ii_last_update,
-             ii.rating AS ii_rating, ii.runtimes AS ii_runtimes,
-             ii.is_mini_series AS ii_is_mini_series, ii.episode_count AS ii_episode_count,
-             ii.title AS ii_title, ii.votes AS ii_votes, ii.year AS ii_year,
-             tsnf.fail_count AS tsnf_fail_count, tsnf.indexer AS tsnf_indexer,
-             tsnf.indexer_id AS tsnf_indexer_id, tsnf.last_check AS tsnf_last_check,
-             tsnf.last_success AS tsnf_last_success
-            FROM tv_shows
-            LEFT JOIN imdb_info ii
-             ON tv_shows.indexer = ii.indexer AND tv_shows.indexer_id = ii.indexer_id
-            LEFT JOIN tv_shows_not_found tsnf
-             ON tv_shows.indexer = tsnf.indexer AND tv_shows.indexer_id = tsnf.indexer_id
-            """)
-        sickgear.showList = []
-        sickgear.showDict = {}
-        for cur_result in sql_result:
-            try:
-                tv_id = int(cur_result['tv_id'])
-                prod_id = int(cur_result['prod_id'])
-                if cur_result['ii_indexer_id']:
-                    imdb_info_sql = {_fk.replace('ii_', ''): _fv for _fk, _fv in iteritems(cur_result)
-                                     if _fk.startswith('ii_')}
-                else:
-                    imdb_info_sql = None
-                show_obj = TVShow(tv_id, prod_id, show_result=cur_result, imdb_info_result=imdb_info_sql)
-                if cur_result['tsnf_indexer_id']:
-                    failed_result = {_fk.replace('tsnf_', ''): _fv for _fk, _fv in iteritems(cur_result)
-                                     if _fk.startswith('tsnf_')}
-                    show_obj.helper_load_failed_db(sql_result=failed_result)
-                sickgear.showList.append(show_obj)
-                sickgear.showDict[show_obj.sid_int] = show_obj
-                _ = show_obj.ids
-            except (BaseException, Exception) as err:
-                logger.error('There was an error creating the show in %s: %s' % (cur_result['location'], ex(err)))
-        sickgear.webserve.Home.make_showlist_unique_names()
-
-    @staticmethod
-    def restore(src_dir, dst_dir):
-        try:
-            for filename in os.listdir(src_dir):
-                src_file = os.path.join(src_dir, filename)
-                dst_file = os.path.join(dst_dir, filename)
-                bak_file = os.path.join(dst_dir, '%s.bak' % filename)
-                shutil.move(dst_file, bak_file)
-                shutil.move(src_file, dst_file)
-
-            os.rmdir(src_dir)
-            return True
-        except (BaseException, Exception):
-            return False
-
-    def shutdown(self, ev_type):
-        logger.debug(f'Shutdown ev_type:{ev_type}, sickgear.started:{sickgear.started}')
-        if sickgear.started:
-            # stop all tasks
-            sickgear.halt()
-
-            # save all shows to DB
-            sickgear.save_all()
-
-            # shutdown web server
-            if self.webserver:
-                logger.log('Shutting down Tornado')
-                self.webserver.shut_down()
-                try:
-                    self.webserver.join(10)
-                except (BaseException, Exception):
-                    pass
-
-            # if run as daemon delete the pidfile
-            if self.run_as_daemon and self.create_pid:
-                self.remove_pid_file(self.pid_file)
-
-            if sickgear.events.SystemEvent.RESTART == ev_type:
-
-                popen_list = []
-
-                if sickgear.update_software_scheduler.action.install_type in ('git', 'source'):
-                    popen_list = [sys.executable, sickgear.MY_FULLNAME]
-
-                if popen_list:
-                    popen_list += sickgear.MY_ARGS
-
-                    if self.run_as_systemd:
-                        logger.log(f'Restarting SickGear with exit(1) handler and {popen_list}')
-                        logger.close()
-                        self.exit(1)
-
-                    if '--nolaunch' not in popen_list:
-                        popen_list += ['--nolaunch']
-                    logger.log(f'Restarting SickGear with {popen_list}')
-                    logger.close()
-                    from _23 import Popen
-                    with Popen(popen_list, cwd=os.getcwd()):
-                        self.exit(0)
-
-        # system exit
-        self.exit(0)
-
-    @staticmethod
-    def exit(code):
-        # noinspection PyProtectedMember,PyUnresolvedReferences
-        os._exit(code)
-
-
-if '__main__' == __name__:
-    freeze_support()
+@app.post("/open-dolphin", response_class=JSONResponse)
+async def open_dolphin(request: Request):
     try:
-        try:
-            # start SickGear
-            SickGear().start()
-        except IOError as e:
-            if e.errno != errno.EINTR:
-                raise
-    except SystemExit as e:
-        print('%s' % ex(e))
-    except (BaseException, Exception) as e:
-        import traceback
-        print(traceback.format_exc())
-        logger.log('SickGear.Start() exception caught %s: %s' % (ex(e), traceback.format_exc()))
+        data = await request.json()
+        path_str = data.get('path')
+        if not path_str:
+            raise HTTPException(status_code=400, detail="Le champ 'path' est manquant.")
+        BIN = shutil.which("dolphin")
+        if not BIN:
+            raise HTTPException(status_code=500, detail="'dolphin' n'a pas été trouvé sur le serveur.")
+        allowed_base = Path(CONFIG.open_dolphin_allowed_base).resolve()
+        user_path = Path(path_str).expanduser().resolve()
+        if allowed_base not in user_path.parents and user_path != allowed_base:
+            raise HTTPException(status_code=403, detail="Le chemin n'est pas autorisé.")
+        subprocess.Popen([BIN, str(user_path)])
+        return JSONResponse(content={'status': 'success', 'message': f"Dolphin ouvert sur '{user_path}'."})
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        return JSONResponse(content={'status': 'error', 'message': str(e)}, status_code=500)
+
+@app.post("/reload-config", response_class=JSONResponse)
+async def reload_config():
+    """Recharge la configuration dynamiquement"""
+    global CONFIG
+    try:
+        CONFIG = load_config()
+        # Recharger les paramètres dépendants de la configuration
+        template_engine._get_template.cache_clear()
+        return {"status": "success", "message": "Configuration rechargée"}
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+@app.get("/config", response_class=JSONResponse)
+async def get_config():
+    """Retourne la configuration actuelle"""
+    return CONFIG.model_dump()
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host=CONFIG.host,
+        port=CONFIG.port,
+        log_level="info"
+    )
